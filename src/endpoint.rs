@@ -355,7 +355,7 @@ where
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        trace!("Polling stream.");
+        info!("Endpoint::poll() called");
         match self.stream.get_mut().poll().unwrap() {
             Async::Ready(Some(msg)) => self.handle_message(msg),
             Async::Ready(None) => {
@@ -391,9 +391,7 @@ where
 
         self.flush();
 
-        trace!("notifying the reactor to reschedule current endpoint for polling");
-        // see https://www.coredump.ch/2017/07/05/understanding-the-tokio-reactor-core/
-        futures::task::current().notify();
+        info!("returning Ok(Async::NotRead), so this future should be polled again later");
         Ok(Async::NotReady)
     }
 }

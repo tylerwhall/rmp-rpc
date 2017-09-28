@@ -128,7 +128,7 @@ fn main() {
             })
             .and_then(|client| {
                 let mut requests = vec![];
-                for i in 0..10 {
+                for i in 0..20 {
                     requests.push(
                         client
                             .request("ping", &[i.into()])
