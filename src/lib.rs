@@ -25,6 +25,6 @@ mod net;
 mod endpoint;
 
 pub use endpoint::{Ack, Client, Response, Service, ServiceBuilder};
-pub use net::{serve, ClientOnlyConnector, Connection, Connector};
+pub use net::{serve, serve_on_listener, ClientOnlyConnector, Connection, Connector};
 
 pub use rmpv::{Integer, Utf8String, Value};

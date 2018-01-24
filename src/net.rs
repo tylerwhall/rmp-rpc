@@ -4,7 +4,7 @@ use tokio_core::reactor::Handle;
 #[cfg(feature = "tokio-tls")]
 use tokio_tls::TlsConnectorExt;
 use tokio_core::net::{TcpListener, TcpStream};
-use std::net::SocketAddr;
+use std::net::{self, SocketAddr};
 use rmpv::Value;
 use std::io;
 
@@ -12,14 +12,24 @@ use std::io;
 use native_tls::TlsConnector;
 use endpoint::{Client, Endpoint, Service, ServiceBuilder};
 
-/// Start a `MessagePack-RPC` server.
+/// Start a `MessagePack-RPC` server by address
 pub fn serve<B: ServiceBuilder + 'static>(
     address: SocketAddr,
     service_builder: B,
     handle: Handle,
 ) -> Box<Future<Item = (), Error = ()>> {
-    let listener = TcpListener::bind(&address, &handle)
-        .unwrap()
+    let listener = net::TcpListener::bind(&address).unwrap();
+    serve_on_listener(listener, address, service_builder, handle).unwrap()
+}
+
+/// Start a `MessagePack-RPC` server on a `TcpListener`
+pub fn serve_on_listener<B: ServiceBuilder + 'static>(
+    listener: net::TcpListener,
+    address: SocketAddr,
+    service_builder: B,
+    handle: Handle,
+) -> io::Result<Box<Future<Item = (), Error = ()>>> {
+    let listener = TcpListener::from_listener(listener, &address, &handle)?
         .incoming()
         .for_each(move |(stream, _address)| {
             let mut endpoint = Endpoint::new(stream);
@@ -29,7 +39,7 @@ pub fn serve<B: ServiceBuilder + 'static>(
             Ok(())
         })
         .map_err(|_| ());
-    Box::new(listener)
+    Ok(Box::new(listener))
 }
 
 #[cfg(feature = "tls")]
