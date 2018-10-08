@@ -501,8 +501,8 @@ struct InnerEndpoint<MH: MessageHandler, T: AsyncRead + AsyncWrite> {
 }
 
 impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> InnerEndpoint<MH, T> {
-    fn new(handler: MH, stream: Transport<T>) -> Self {
-        InnerEndpoint { handler, stream }
+    fn new(handler: MH, stream: T) -> Self {
+        InnerEndpoint { handler, stream: Codec.framed(stream) }
     }
 }
 
@@ -678,7 +678,7 @@ impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
                     client,
                     server: Server::new(service),
                 },
-                Codec.framed(stream),
+                stream,
             ),
         }
     }
@@ -763,7 +763,7 @@ impl Client {
     /// [`DefaultExecutor`](tokio::executor::DefaultExecutor)
     pub fn new<T: AsyncRead + AsyncWrite + 'static + Send>(stream: T) -> Self {
         let (inner_client, client) = InnerClient::new();
-        let endpoint = InnerEndpoint::new(inner_client, Codec.framed(stream));
+        let endpoint = InnerEndpoint::new(inner_client, stream);
         // We swallow io::Errors. The client will see an error if it has any outstanding requests
         // or if it tries to send anything, because the endpoint has terminated.
         tokio::spawn(
