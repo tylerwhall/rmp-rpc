@@ -6,7 +6,7 @@ use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, Stream};
 use rmpv::Value;
 use tokio;
 use tokio::codec::{FramedRead, FramedWrite};
-use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncWrite, ErrorKind, ReadHalf};
 
 use codec::Codec;
 use message::Response as MsgPackResponse;
@@ -115,9 +115,9 @@ impl<S: Service> ServiceWithClient for S {
     }
 }
 
-struct Server<S: ServiceWithClient, T: AsyncWrite> {
+struct Server<S: ServiceWithClient> {
     service: S,
-    sink: RpcSink<T>,
+    sink: RpcSink,
     // This will receive responses from the service (or possibly from whatever worker tasks that
     // the service spawned). The u32 contains the id of the request that the response is for.
     pending_responses: mpsc::UnboundedReceiver<(u32, Result<Value, Value>)>,
@@ -129,8 +129,8 @@ struct Server<S: ServiceWithClient, T: AsyncWrite> {
     // apply backpressure there.
 }
 
-impl<S: ServiceWithClient, T: AsyncWrite> Server<S, T> {
-    fn new(service: S, sink: RpcSink<T>) -> Self {
+impl<S: ServiceWithClient> Server<S> {
+    fn new(service: S, sink: RpcSink) -> Self {
         let (send, recv) = mpsc::unbounded();
 
         Server {
@@ -145,23 +145,20 @@ impl<S: ServiceWithClient, T: AsyncWrite> Server<S, T> {
     //
     // Returns Async::Ready if all of the pending responses were successfully sent on their way.
     // (This does not necessarily mean that they were received yet.)
-    fn send_responses<U: Sink<SinkItem = Message, SinkError = io::Error>>(
-        &mut self,
-        sink: &mut U,
-    ) -> Poll<(), io::Error> {
+    fn send_responses(&mut self) -> Poll<(), ()> {
         while let Ok(poll) = self.pending_responses.poll() {
             if let Async::Ready(Some((id, result))) = poll {
                 let msg = Message::Response(MsgPackResponse { id, result });
                 // FIXME: in futures 0.2, use poll_ready before reading from pending_responses, and
                 // don't panic here.
-                sink.start_send(msg).unwrap();
+                self.sink.start_send(msg).unwrap();
             } else {
                 if let Async::Ready(None) = poll {
                     panic!("we store the sender, it can't be dropped");
                 }
 
                 // We're done pushing all messages into the sink, now try to flush it.
-                return sink.poll_complete();
+                return self.sink.poll_complete();
             }
         }
         panic!("an UnboundedReceiver should never give an error");
@@ -206,10 +203,7 @@ trait MessageHandler {
     // Try to push out all of the outgoing messages (e.g. responses in the case of a server,
     // notifications+requests in the case of a client) onto the sink. Return Ok(Async::Ready(()))
     // if we managed to push them all out and flush the sink.
-    fn send_outgoing<T: Sink<SinkItem = Message, SinkError = io::Error>>(
-        &mut self,
-        sink: &mut T,
-    ) -> Poll<(), io::Error>;
+    fn send_outgoing(&mut self) -> Poll<(), ()>;
 
     // Is the endpoint finished? This is only relevant for clients, since servers and
     // client+servers will never voluntarily stop.
@@ -327,14 +321,11 @@ impl InnerClient {
         }
     }
 
-    fn send_messages<T: Sink<SinkItem = Message, SinkError = io::Error>>(
-        &mut self,
-        sink: &mut T,
-    ) -> Poll<(), io::Error> {
-        self.process_requests(sink);
-        self.process_notifications(sink);
+    fn send_messages(&mut self) -> Poll<(), ()> {
+        self.process_requests(self.sink);
+        self.process_notifications(self.sink);
 
-        match sink.poll_complete()? {
+        match self.sink.poll_complete()? {
             Async::Ready(()) => {
                 self.acknowledge_notifications();
                 Ok(Async::Ready(()))
@@ -407,7 +398,7 @@ impl InnerClient {
     }
 }
 
-impl<S: Service, T: AsyncWrite> MessageHandler for Server<S, T> {
+impl<S: Service> MessageHandler for Server<S> {
     fn handle_incoming(&mut self, msg: Message) {
         match msg {
             Message::Request(req) => {
@@ -423,11 +414,8 @@ impl<S: Service, T: AsyncWrite> MessageHandler for Server<S, T> {
         };
     }
 
-    fn send_outgoing<U: Sink<SinkItem = Message, SinkError = io::Error>>(
-        &mut self,
-        sink: &mut U,
-    ) -> Poll<(), io::Error> {
-        self.send_responses(sink)
+    fn send_outgoing(&mut self) -> Poll<(), ()> {
+        self.send_responses()
     }
 }
 
@@ -441,11 +429,8 @@ impl MessageHandler for InnerClient {
         }
     }
 
-    fn send_outgoing<T: Sink<SinkItem = Message, SinkError = io::Error>>(
-        &mut self,
-        sink: &mut T,
-    ) -> Poll<(), io::Error> {
-        self.send_messages(sink)
+    fn send_outgoing(&mut self) -> Poll<(), ()> {
+        self.send_messages()
     }
 
     fn is_finished(&self) -> bool {
@@ -455,13 +440,13 @@ impl MessageHandler for InnerClient {
     }
 }
 
-struct ClientAndServer<S: ServiceWithClient, T: AsyncWrite> {
+struct ClientAndServer<S: ServiceWithClient> {
     inner_client: InnerClient,
-    server: Server<S, T>,
+    server: Server<S>,
     client: Client,
 }
 
-impl<S: ServiceWithClient, T: AsyncWrite> MessageHandler for ClientAndServer<S, T> {
+impl<S: ServiceWithClient> MessageHandler for ClientAndServer<S> {
     fn handle_incoming(&mut self, msg: Message) {
         match msg {
             Message::Request(req) => {
@@ -483,12 +468,9 @@ impl<S: ServiceWithClient, T: AsyncWrite> MessageHandler for ClientAndServer<S, 
         };
     }
 
-    fn send_outgoing<U: Sink<SinkItem = Message, SinkError = io::Error>>(
-        &mut self,
-        sink: &mut U,
-    ) -> Poll<(), io::Error> {
-        if let Async::Ready(_) = self.server.send_responses(sink)? {
-            self.inner_client.send_messages(sink)
+    fn send_outgoing(&mut self) -> Poll<(), ()> {
+        if let Async::Ready(_) = self.server.send_responses()? {
+            self.inner_client.send_messages()
         } else {
             Ok(Async::NotReady)
         }
@@ -496,39 +478,38 @@ impl<S: ServiceWithClient, T: AsyncWrite> MessageHandler for ClientAndServer<S, 
 }
 
 type RpcStream<T> = FramedRead<ReadHalf<T>, Codec>;
-type RpcSink<T> = FramedWrite<WriteHalf<T>, Codec>;
+type RpcSink = Box<Sink<SinkItem = Message, SinkError = ()> + Send>;
 
-struct InnerEndpoint<MH: MessageHandler, T: AsyncRead + AsyncWrite> {
+struct InnerEndpoint<MH: MessageHandler, T: AsyncRead> {
     handler: MH,
     stream: RpcStream<T>,
-    sink: RpcSink<T>,
 }
 
-impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> InnerEndpoint<MH, T> {
-    fn new(handler: MH, stream: RpcStream<T>, sink: RpcSink<T>) -> Self {
-        InnerEndpoint {
-            handler,
-            stream,
-            sink,
-        }
+impl<MH: MessageHandler, T: AsyncRead> InnerEndpoint<MH, T> {
+    fn new(handler: MH, stream: RpcStream<T>) -> Self {
+        InnerEndpoint { handler, stream }
     }
 }
 
-impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> Future for InnerEndpoint<MH, T> {
+impl<MH: MessageHandler, T: AsyncRead> Future for InnerEndpoint<MH, T> {
     type Item = ();
-    type Error = io::Error;
+    type Error = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         // Try to flush out all the responses that are queued up. If this doesn't succeed yet, our
         // output sink is full. In that case, we'll apply some backpressure to our input stream by
         // not reading from it.
-        if let Async::NotReady = self.handler.send_outgoing(&mut self.sink)? {
+        if let Async::NotReady = self.handler.send_outgoing()? {
             trace!("Sink not yet flushed, waiting...");
             return Ok(Async::NotReady);
         }
 
         trace!("Polling stream.");
-        while let Async::Ready(msg) = self.stream.poll()? {
+        while let Async::Ready(msg) = self
+            .stream
+            .poll()
+            .map_err(|e| trace!("Client endpoint closed because of an error {}", e))?
+        {
             if let Some(msg) = msg {
                 self.handler.handle_incoming(msg);
             } else {
@@ -554,7 +535,7 @@ impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> Future for InnerEndpoint<MH,
 ///
 /// The returned future will run until the stream is closed; if the stream encounters an error,
 /// then the future will propagate it and terminate.
-pub fn serve<'a, S: Service + 'a, T: AsyncRead + AsyncWrite + 'a + Send>(
+pub fn serve<'a, S: Service + 'a, T: AsyncRead + AsyncWrite + Send + 'static>(
     stream: T,
     service: S,
 ) -> impl Future<Item = (), Error = io::Error> + 'a + Send {
@@ -562,16 +543,16 @@ pub fn serve<'a, S: Service + 'a, T: AsyncRead + AsyncWrite + 'a + Send>(
 }
 
 struct ServerEndpoint<S: Service, T: AsyncRead + AsyncWrite> {
-    inner: InnerEndpoint<Server<S, T>, T>,
+    inner: InnerEndpoint<Server<S>, T>,
 }
 
-impl<S: Service, T: AsyncRead + AsyncWrite> ServerEndpoint<S, T> {
+impl<S: Service, T: AsyncRead + AsyncWrite + Send + 'static> ServerEndpoint<S, T> {
     pub fn new(stream: T, service: S) -> Self {
         let (reader, writer) = stream.split();
         let stream = FramedRead::new(reader, Codec);
-        let sink = FramedWrite::new(writer, Codec);
+        let sink = FramedWrite::new(writer, Codec).sink_map_err(|e| error!("sink error {}", e));
         ServerEndpoint {
-            inner: InnerEndpoint::new(Server::new(service, sink), stream),
+            inner: InnerEndpoint::new(Server::new(service, Box::new(sink)), stream),
         }
     }
 }
@@ -581,7 +562,7 @@ impl<S: Service, T: AsyncRead + AsyncWrite> Future for ServerEndpoint<S, T> {
     type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.inner.poll()
+        self.inner.poll().map_err(|_| ErrorKind::Other.into())
     }
 }
 
@@ -672,25 +653,24 @@ impl<S: Service, T: AsyncRead + AsyncWrite> Future for ServerEndpoint<S, T> {
 /// }
 /// ```
 pub struct Endpoint<S: ServiceWithClient, T: AsyncRead + AsyncWrite> {
-    inner: InnerEndpoint<ClientAndServer<S, T>, T>,
+    inner: InnerEndpoint<ClientAndServer<S>, T>,
 }
 
-impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
+impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite + Send + 'static> Endpoint<S, T> {
     /// Creates a new `Endpoint` on `stream`, using `service` to handle requests and notifications.
     pub fn new(stream: T, service: S) -> Self {
         let (inner_client, client) = InnerClient::new();
         let (reader, writer) = stream.split();
         let stream = FramedRead::new(reader, Codec);
-        let sink = FramedWrite::new(writer, Codec);
+        let sink = FramedWrite::new(writer, Codec).sink_map_err(|e| error!("sink error {}", e));
         Endpoint {
             inner: InnerEndpoint::new(
                 ClientAndServer {
                     inner_client,
                     client,
-                    server: Server::new(service, sink),
+                    server: Server::new(service, Box::new(sink)),
                 },
                 stream,
-                sink,
             ),
         }
     }
@@ -704,7 +684,7 @@ impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
 
 impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Future for Endpoint<S, T> {
     type Item = ();
-    type Error = io::Error;
+    type Error = ();
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
         self.inner.poll()
@@ -778,12 +758,10 @@ impl Client {
         let (reader, writer) = stream.split();
         let stream = FramedRead::new(reader, Codec);
         let sink = FramedWrite::new(writer, Codec);
-        let endpoint = InnerEndpoint::new(inner_client, stream, sink);
+        let endpoint = InnerEndpoint::new(inner_client, stream);
         // We swallow io::Errors. The client will see an error if it has any outstanding requests
         // or if it tries to send anything, because the endpoint has terminated.
-        tokio::spawn(
-            endpoint.map_err(|e| trace!("Client endpoint closed because of an error: {}", e)),
-        );
+        tokio::spawn(endpoint);
         client
     }
 
