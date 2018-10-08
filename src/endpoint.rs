@@ -255,6 +255,7 @@ impl Future for Ack {
 struct InnerClient {
     client_closed: bool,
     request_id: u32,
+    sink: RpcSink,
     requests_rx: RequestRx,
     notifications_rx: NotificationRx,
     pending_requests: HashMap<u32, ResponseTx>,
@@ -262,7 +263,7 @@ struct InnerClient {
 }
 
 impl InnerClient {
-    fn new() -> (Self, Client) {
+    fn new(sink: RpcSink) -> (Self, Client) {
         let (requests_tx, requests_rx) = mpsc::unbounded();
         let (notifications_tx, notifications_rx) = mpsc::unbounded();
 
@@ -271,6 +272,7 @@ impl InnerClient {
         let client = InnerClient {
             client_closed: false,
             request_id: 0,
+            sink,
             requests_rx,
             notifications_rx,
             pending_requests: HashMap::new(),
@@ -280,10 +282,7 @@ impl InnerClient {
         (client, client_proxy)
     }
 
-    fn process_notifications<T: Sink<SinkItem = Message, SinkError = io::Error>>(
-        &mut self,
-        sink: &mut T,
-    ) {
+    fn process_notifications(&mut self) {
         // Don't try to process notifications after the notifications channel was closed, because
         // trying to read from it might cause panics.
         if self.client_closed {
@@ -295,11 +294,11 @@ impl InnerClient {
             match self.notifications_rx.poll() {
                 Ok(Async::Ready(Some((notification, ack_sender)))) => {
                     trace!("Got notification from client.");
-                    match sink.start_send(Message::Notification(notification)) {
+                    match self.sink.start_send(Message::Notification(notification)) {
                         Ok(AsyncSink::Ready) => (),
                         // FIXME: there should probably be a retry mechanism.
                         Ok(AsyncSink::NotReady(_message)) => panic!("The sink is full."),
-                        Err(e) => panic!("An error occured while trying to send message: {}", e),
+                        Err(_) => panic!("An error occured while trying to send message"),
                     }
                     self.pending_notifications.push(ack_sender);
                 }
@@ -322,8 +321,8 @@ impl InnerClient {
     }
 
     fn send_messages(&mut self) -> Poll<(), ()> {
-        self.process_requests(self.sink);
-        self.process_notifications(self.sink);
+        self.process_requests();
+        self.process_notifications();
 
         match self.sink.poll_complete()? {
             Async::Ready(()) => {
@@ -334,10 +333,7 @@ impl InnerClient {
         }
     }
 
-    fn process_requests<T: Sink<SinkItem = Message, SinkError = io::Error>>(
-        &mut self,
-        sink: &mut T,
-    ) {
+    fn process_requests(&mut self) {
         // Don't try to process requests after the requests channel was closed, because
         // trying to read from it might cause panics.
         if self.client_closed {
@@ -350,11 +346,11 @@ impl InnerClient {
                     self.request_id += 1;
                     trace!("Got request from client: {:?}", request);
                     request.id = self.request_id;
-                    match sink.start_send(Message::Request(request)) {
+                    match self.sink.start_send(Message::Request(request)) {
                         Ok(AsyncSink::Ready) => (),
                         // FIXME: there should probably be a retry mechanism.
                         Ok(AsyncSink::NotReady(_message)) => panic!("The sink is full."),
-                        Err(e) => panic!("An error occured while trying to send message: {}", e),
+                        Err(_) => panic!("An error occured while trying to send message"),
                     }
                     self.pending_requests
                         .insert(self.request_id, response_sender);
@@ -654,24 +650,38 @@ impl<S: Service, T: AsyncRead + AsyncWrite> Future for ServerEndpoint<S, T> {
 /// ```
 pub struct Endpoint<S: ServiceWithClient, T: AsyncRead + AsyncWrite> {
     inner: InnerEndpoint<ClientAndServer<S>, T>,
+    forward: Box<Future<Item = (), Error = io::Error> + Send>,
 }
 
 impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite + Send + 'static> Endpoint<S, T> {
     /// Creates a new `Endpoint` on `stream`, using `service` to handle requests and notifications.
     pub fn new(stream: T, service: S) -> Self {
-        let (inner_client, client) = InnerClient::new();
         let (reader, writer) = stream.split();
         let stream = FramedRead::new(reader, Codec);
-        let sink = FramedWrite::new(writer, Codec).sink_map_err(|e| error!("sink error {}", e));
+        let sink = FramedWrite::new(writer, Codec);
+
+        let (tx, rx) = mpsc::channel(8);
+        let client_tx = tx.clone().sink_map_err(|_| ());
+        let server_tx = tx.sink_map_err(|_| ());
+
+        let (inner_client, client) = InnerClient::new(Box::new(client_tx));
+
+        let forward = Box::new(
+            // This can't happen because we own the tx sides.
+            rx.map_err(|_| panic!("client/server senders dropped"))
+                .forward(sink)
+                .map(|_| ()),
+        );
         Endpoint {
             inner: InnerEndpoint::new(
                 ClientAndServer {
                     inner_client,
                     client,
-                    server: Server::new(service, Box::new(sink)),
+                    server: Server::new(service, Box::new(server_tx)),
                 },
                 stream,
             ),
+            forward,
         }
     }
 
@@ -684,10 +694,14 @@ impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite + Send + 'static> Endpoint<
 
 impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Future for Endpoint<S, T> {
     type Item = ();
-    type Error = ();
+    type Error = io::Error;
 
     fn poll(&mut self) -> Poll<Self::Item, Self::Error> {
-        self.inner.poll()
+        if self.forward.poll()?.is_ready() || self.inner.poll().expect("inner").is_ready() {
+            Ok(Async::Ready(()))
+        } else {
+            Ok(Async::NotReady)
+        }
     }
 }
 
@@ -754,10 +768,15 @@ impl Client {
     ///
     /// [`DefaultExecutor`](tokio::executor::DefaultExecutor)
     pub fn new<T: AsyncRead + AsyncWrite + 'static + Send>(stream: T) -> Self {
-        let (inner_client, client) = InnerClient::new();
         let (reader, writer) = stream.split();
         let stream = FramedRead::new(reader, Codec);
-        let sink = FramedWrite::new(writer, Codec);
+        let sink = FramedWrite::new(writer, Codec).sink_map_err(|e| error!("sink error {}", e));
+
+        let (tx, rx) = mpsc::channel(8);
+        let client_tx = tx.clone().sink_map_err(|_| ());
+        tokio::spawn(rx.forward(sink).map(|_| ()));
+
+        let (inner_client, client) = InnerClient::new(Box::new(client_tx));
         let endpoint = InnerEndpoint::new(inner_client, stream);
         // We swallow io::Errors. The client will see an error if it has any outstanding requests
         // or if it tries to send anything, because the endpoint has terminated.
