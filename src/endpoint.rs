@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::io;
 
 use futures::sync::{mpsc, oneshot};
-use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, StartSend, Stream};
+use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, Stream};
 use rmpv::Value;
 use tokio;
 use tokio::codec::{Decoder, Framed};
@@ -152,14 +152,14 @@ impl<S: ServiceWithClient> Server<S> {
                 let msg = Message::Response(MsgPackResponse { id, result });
                 // FIXME: in futures 0.2, use poll_ready before reading from pending_responses, and
                 // don't panic here.
-                sink.start_send(msg).unwrap();
+                sink.0.start_send(msg).unwrap();
             } else {
                 if let Async::Ready(None) = poll {
                     panic!("we store the sender, it can't be dropped");
                 }
 
                 // We're done pushing all messages into the sink, now try to flush it.
-                return sink.poll_complete();
+                return sink.0.poll_complete();
             }
         }
         panic!("an UnboundedReceiver should never give an error");
@@ -284,7 +284,10 @@ impl InnerClient {
         (client, client_proxy)
     }
 
-    fn process_notifications<T: AsyncRead + AsyncWrite>(&mut self, stream: &mut Transport<T>) {
+    fn process_notifications<T: Sink<SinkItem = Message, SinkError = io::Error>>(
+        &mut self,
+        sink: &mut T,
+    ) {
         // Don't try to process notifications after the notifications channel was closed, because
         // trying to read from it might cause panics.
         if self.client_closed {
@@ -296,7 +299,12 @@ impl InnerClient {
             match self.notifications_rx.poll() {
                 Ok(Async::Ready(Some((notification, ack_sender)))) => {
                     trace!("Got notification from client.");
-                    stream.send(Message::Notification(notification));
+                    match sink.start_send(Message::Notification(notification)) {
+                        Ok(AsyncSink::Ready) => (),
+                        // FIXME: there should probably be a retry mechanism.
+                        Ok(AsyncSink::NotReady(_message)) => panic!("The sink is full."),
+                        Err(e) => panic!("An error occured while trying to send message: {}", e),
+                    }
                     self.pending_notifications.push(ack_sender);
                 }
                 Ok(Async::NotReady) => {
@@ -317,14 +325,14 @@ impl InnerClient {
         }
     }
 
-    fn send_messages<T: AsyncRead + AsyncWrite>(
+    fn send_messages<T: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        stream: &mut Transport<T>,
+        sink: &mut T,
     ) -> Poll<(), io::Error> {
-        self.process_requests(stream);
-        self.process_notifications(stream);
+        self.process_requests(sink);
+        self.process_notifications(sink);
 
-        match stream.poll_complete()? {
+        match sink.poll_complete()? {
             Async::Ready(()) => {
                 self.acknowledge_notifications();
                 Ok(Async::Ready(()))
@@ -333,7 +341,10 @@ impl InnerClient {
         }
     }
 
-    fn process_requests<T: AsyncRead + AsyncWrite>(&mut self, stream: &mut Transport<T>) {
+    fn process_requests<T: Sink<SinkItem = Message, SinkError = io::Error>>(
+        &mut self,
+        sink: &mut T,
+    ) {
         // Don't try to process requests after the requests channel was closed, because
         // trying to read from it might cause panics.
         if self.client_closed {
@@ -346,7 +357,12 @@ impl InnerClient {
                     self.request_id += 1;
                     trace!("Got request from client: {:?}", request);
                     request.id = self.request_id;
-                    stream.send(Message::Request(request));
+                    match sink.start_send(Message::Request(request)) {
+                        Ok(AsyncSink::Ready) => (),
+                        // FIXME: there should probably be a retry mechanism.
+                        Ok(AsyncSink::NotReady(_message)) => panic!("The sink is full."),
+                        Err(e) => panic!("An error occured while trying to send message: {}", e),
+                    }
                     self.pending_requests
                         .insert(self.request_id, response_sender);
                 }
@@ -391,49 +407,6 @@ impl InnerClient {
 
 struct Transport<T: AsyncRead + AsyncWrite>(Framed<T, Codec>);
 
-impl<T> Transport<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    fn send(&mut self, message: Message) {
-        trace!("Sending {:?}", message);
-        match self.start_send(message) {
-            Ok(AsyncSink::Ready) => return,
-            // FIXME: there should probably be a retry mechanism.
-            Ok(AsyncSink::NotReady(_message)) => panic!("The sink is full."),
-            Err(e) => panic!("An error occured while trying to send message: {}", e),
-        }
-    }
-}
-
-impl<T> Stream for Transport<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    type Item = Message;
-    type Error = io::Error;
-
-    fn poll(&mut self) -> Poll<Option<Self::Item>, Self::Error> {
-        self.0.poll()
-    }
-}
-
-impl<T> Sink for Transport<T>
-where
-    T: AsyncRead + AsyncWrite,
-{
-    type SinkItem = Message;
-    type SinkError = io::Error;
-
-    fn start_send(&mut self, item: Self::SinkItem) -> StartSend<Self::SinkItem, Self::SinkError> {
-        self.0.start_send(item)
-    }
-
-    fn poll_complete(&mut self) -> Poll<(), Self::SinkError> {
-        self.0.poll_complete()
-    }
-}
-
 impl<S: Service> MessageHandler for Server<S> {
     fn handle_incoming(&mut self, msg: Message) {
         match msg {
@@ -472,7 +445,7 @@ impl MessageHandler for InnerClient {
         &mut self,
         sink: &mut Transport<T>,
     ) -> Poll<(), io::Error> {
-        self.send_messages(sink)
+        self.send_messages(&mut sink.0)
     }
 
     fn is_finished(&self) -> bool {
@@ -515,7 +488,7 @@ impl<S: ServiceWithClient> MessageHandler for ClientAndServer<S> {
         sink: &mut Transport<T>,
     ) -> Poll<(), io::Error> {
         if let Async::Ready(_) = self.server.send_responses(sink)? {
-            self.inner_client.send_messages(sink)
+            self.inner_client.send_messages(&mut sink.0)
         } else {
             Ok(Async::NotReady)
         }
@@ -541,7 +514,7 @@ impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> Future for InnerEndpoint<MH,
         }
 
         trace!("Polling stream.");
-        while let Async::Ready(msg) = self.stream.poll()? {
+        while let Async::Ready(msg) = self.stream.0.poll()? {
             if let Some(msg) = msg {
                 self.handler.handle_incoming(msg);
             } else {
