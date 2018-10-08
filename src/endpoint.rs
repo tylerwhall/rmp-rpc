@@ -405,7 +405,7 @@ impl InnerClient {
     }
 }
 
-struct Transport<T: AsyncRead + AsyncWrite>(Framed<T, Codec>);
+type Transport<T: AsyncRead + AsyncWrite> = Framed<T, Codec>;
 
 impl<S: Service> MessageHandler for Server<S> {
     fn handle_incoming(&mut self, msg: Message) {
@@ -514,13 +514,13 @@ impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> Future for InnerEndpoint<MH,
         // Try to flush out all the responses that are queued up. If this doesn't succeed yet, our
         // output sink is full. In that case, we'll apply some backpressure to our input stream by
         // not reading from it.
-        if let Async::NotReady = self.handler.send_outgoing(&mut self.stream.0)? {
+        if let Async::NotReady = self.handler.send_outgoing(&mut self.stream)? {
             trace!("Sink not yet flushed, waiting...");
             return Ok(Async::NotReady);
         }
 
         trace!("Polling stream.");
-        while let Async::Ready(msg) = self.stream.0.poll()? {
+        while let Async::Ready(msg) = self.stream.poll()? {
             if let Some(msg) = msg {
                 self.handler.handle_incoming(msg);
             } else {
@@ -561,7 +561,7 @@ impl<S: Service, T: AsyncRead + AsyncWrite> ServerEndpoint<S, T> {
     pub fn new(stream: T, service: S) -> Self {
         ServerEndpoint {
             inner: InnerEndpoint {
-                stream: Transport(Codec.framed(stream)),
+                stream: Codec.framed(stream),
                 handler: Server::new(service),
             },
         }
@@ -678,7 +678,7 @@ impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
                     client,
                     server: Server::new(service),
                 },
-                Transport(Codec.framed(stream)),
+                Codec.framed(stream),
             ),
         }
     }
@@ -763,7 +763,7 @@ impl Client {
     /// [`DefaultExecutor`](tokio::executor::DefaultExecutor)
     pub fn new<T: AsyncRead + AsyncWrite + 'static + Send>(stream: T) -> Self {
         let (inner_client, client) = InnerClient::new();
-        let endpoint = InnerEndpoint::new(inner_client, Transport(Codec.framed(stream)));
+        let endpoint = InnerEndpoint::new(inner_client, Codec.framed(stream));
         // We swallow io::Errors. The client will see an error if it has any outstanding requests
         // or if it tries to send anything, because the endpoint has terminated.
         tokio::spawn(
