@@ -115,8 +115,9 @@ impl<S: Service> ServiceWithClient for S {
     }
 }
 
-struct Server<S: ServiceWithClient> {
+struct Server<S: ServiceWithClient, T: AsyncWrite> {
     service: S,
+    sink: RpcSink<T>,
     // This will receive responses from the service (or possibly from whatever worker tasks that
     // the service spawned). The u32 contains the id of the request that the response is for.
     pending_responses: mpsc::UnboundedReceiver<(u32, Result<Value, Value>)>,
@@ -128,12 +129,13 @@ struct Server<S: ServiceWithClient> {
     // apply backpressure there.
 }
 
-impl<S: ServiceWithClient> Server<S> {
-    fn new(service: S) -> Self {
+impl<S: ServiceWithClient, T: AsyncWrite> Server<S, T> {
+    fn new(service: S, sink: RpcSink<T>) -> Self {
         let (send, recv) = mpsc::unbounded();
 
         Server {
             service,
+            sink,
             pending_responses: recv,
             response_sender: send,
         }
@@ -143,9 +145,9 @@ impl<S: ServiceWithClient> Server<S> {
     //
     // Returns Async::Ready if all of the pending responses were successfully sent on their way.
     // (This does not necessarily mean that they were received yet.)
-    fn send_responses<T: Sink<SinkItem = Message, SinkError = io::Error>>(
+    fn send_responses<U: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        sink: &mut T,
+        sink: &mut U,
     ) -> Poll<(), io::Error> {
         while let Ok(poll) = self.pending_responses.poll() {
             if let Async::Ready(Some((id, result))) = poll {
@@ -405,7 +407,7 @@ impl InnerClient {
     }
 }
 
-impl<S: Service> MessageHandler for Server<S> {
+impl<S: Service, T: AsyncWrite> MessageHandler for Server<S, T> {
     fn handle_incoming(&mut self, msg: Message) {
         match msg {
             Message::Request(req) => {
@@ -421,9 +423,9 @@ impl<S: Service> MessageHandler for Server<S> {
         };
     }
 
-    fn send_outgoing<T: Sink<SinkItem = Message, SinkError = io::Error>>(
+    fn send_outgoing<U: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        sink: &mut T,
+        sink: &mut U,
     ) -> Poll<(), io::Error> {
         self.send_responses(sink)
     }
@@ -453,13 +455,13 @@ impl MessageHandler for InnerClient {
     }
 }
 
-struct ClientAndServer<S: ServiceWithClient> {
+struct ClientAndServer<S: ServiceWithClient, T: AsyncWrite> {
     inner_client: InnerClient,
-    server: Server<S>,
+    server: Server<S, T>,
     client: Client,
 }
 
-impl<S: ServiceWithClient> MessageHandler for ClientAndServer<S> {
+impl<S: ServiceWithClient, T: AsyncWrite> MessageHandler for ClientAndServer<S, T> {
     fn handle_incoming(&mut self, msg: Message) {
         match msg {
             Message::Request(req) => {
@@ -481,9 +483,9 @@ impl<S: ServiceWithClient> MessageHandler for ClientAndServer<S> {
         };
     }
 
-    fn send_outgoing<T: Sink<SinkItem = Message, SinkError = io::Error>>(
+    fn send_outgoing<U: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        sink: &mut T,
+        sink: &mut U,
     ) -> Poll<(), io::Error> {
         if let Async::Ready(_) = self.server.send_responses(sink)? {
             self.inner_client.send_messages(sink)
@@ -560,7 +562,7 @@ pub fn serve<'a, S: Service + 'a, T: AsyncRead + AsyncWrite + 'a + Send>(
 }
 
 struct ServerEndpoint<S: Service, T: AsyncRead + AsyncWrite> {
-    inner: InnerEndpoint<Server<S>, T>,
+    inner: InnerEndpoint<Server<S, T>, T>,
 }
 
 impl<S: Service, T: AsyncRead + AsyncWrite> ServerEndpoint<S, T> {
@@ -569,7 +571,7 @@ impl<S: Service, T: AsyncRead + AsyncWrite> ServerEndpoint<S, T> {
         let stream = FramedRead::new(reader, Codec);
         let sink = FramedWrite::new(writer, Codec);
         ServerEndpoint {
-            inner: InnerEndpoint::new(Server::new(service), stream, sink),
+            inner: InnerEndpoint::new(Server::new(service, sink), stream),
         }
     }
 }
@@ -670,7 +672,7 @@ impl<S: Service, T: AsyncRead + AsyncWrite> Future for ServerEndpoint<S, T> {
 /// }
 /// ```
 pub struct Endpoint<S: ServiceWithClient, T: AsyncRead + AsyncWrite> {
-    inner: InnerEndpoint<ClientAndServer<S>, T>,
+    inner: InnerEndpoint<ClientAndServer<S, T>, T>,
 }
 
 impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
@@ -685,7 +687,7 @@ impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
                 ClientAndServer {
                     inner_client,
                     client,
-                    server: Server::new(service),
+                    server: Server::new(service, sink),
                 },
                 stream,
                 sink,
