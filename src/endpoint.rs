@@ -493,19 +493,21 @@ impl<S: ServiceWithClient> MessageHandler for ClientAndServer<S> {
     }
 }
 
+type RpcStream<T> = FramedRead<ReadHalf<T>, Codec>;
+type RpcSink<T> = FramedWrite<WriteHalf<T>, Codec>;
+
 struct InnerEndpoint<MH: MessageHandler, T: AsyncRead + AsyncWrite> {
     handler: MH,
-    stream: FramedRead<ReadHalf<T>, Codec>,
-    sink: FramedWrite<WriteHalf<T>, Codec>,
+    stream: RpcStream<T>,
+    sink: RpcSink<T>,
 }
 
 impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> InnerEndpoint<MH, T> {
-    fn new(handler: MH, stream: T) -> Self {
-        let (reader, writer) = stream.split();
+    fn new(handler: MH, stream: RpcStream<T>, sink: RpcSink<T>) -> Self {
         InnerEndpoint {
             handler,
-            stream: FramedRead::new(reader, Codec),
-            sink: FramedWrite::new(writer, Codec),
+            stream,
+            sink,
         }
     }
 }
@@ -563,8 +565,11 @@ struct ServerEndpoint<S: Service, T: AsyncRead + AsyncWrite> {
 
 impl<S: Service, T: AsyncRead + AsyncWrite> ServerEndpoint<S, T> {
     pub fn new(stream: T, service: S) -> Self {
+        let (reader, writer) = stream.split();
+        let stream = FramedRead::new(reader, Codec);
+        let sink = FramedWrite::new(writer, Codec);
         ServerEndpoint {
-            inner: InnerEndpoint::new(Server::new(service), stream),
+            inner: InnerEndpoint::new(Server::new(service), stream, sink),
         }
     }
 }
@@ -672,6 +677,9 @@ impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
     /// Creates a new `Endpoint` on `stream`, using `service` to handle requests and notifications.
     pub fn new(stream: T, service: S) -> Self {
         let (inner_client, client) = InnerClient::new();
+        let (reader, writer) = stream.split();
+        let stream = FramedRead::new(reader, Codec);
+        let sink = FramedWrite::new(writer, Codec);
         Endpoint {
             inner: InnerEndpoint::new(
                 ClientAndServer {
@@ -680,6 +688,7 @@ impl<S: ServiceWithClient, T: AsyncRead + AsyncWrite> Endpoint<S, T> {
                     server: Server::new(service),
                 },
                 stream,
+                sink,
             ),
         }
     }
@@ -764,7 +773,10 @@ impl Client {
     /// [`DefaultExecutor`](tokio::executor::DefaultExecutor)
     pub fn new<T: AsyncRead + AsyncWrite + 'static + Send>(stream: T) -> Self {
         let (inner_client, client) = InnerClient::new();
-        let endpoint = InnerEndpoint::new(inner_client, stream);
+        let (reader, writer) = stream.split();
+        let stream = FramedRead::new(reader, Codec);
+        let sink = FramedWrite::new(writer, Codec);
+        let endpoint = InnerEndpoint::new(inner_client, stream, sink);
         // We swallow io::Errors. The client will see an error if it has any outstanding requests
         // or if it tries to send anything, because the endpoint has terminated.
         tokio::spawn(
