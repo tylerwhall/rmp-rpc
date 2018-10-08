@@ -5,8 +5,8 @@ use futures::sync::{mpsc, oneshot};
 use futures::{Async, AsyncSink, Future, IntoFuture, Poll, Sink, Stream};
 use rmpv::Value;
 use tokio;
-use tokio::codec::{Decoder, Framed};
-use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::codec::{FramedRead, FramedWrite};
+use tokio::io::{AsyncRead, AsyncWrite, ReadHalf, WriteHalf};
 
 use codec::Codec;
 use message::Response as MsgPackResponse;
@@ -405,8 +405,6 @@ impl InnerClient {
     }
 }
 
-type Transport<T: AsyncRead + AsyncWrite> = Framed<T, Codec>;
-
 impl<S: Service> MessageHandler for Server<S> {
     fn handle_incoming(&mut self, msg: Message) {
         match msg {
@@ -497,12 +495,18 @@ impl<S: ServiceWithClient> MessageHandler for ClientAndServer<S> {
 
 struct InnerEndpoint<MH: MessageHandler, T: AsyncRead + AsyncWrite> {
     handler: MH,
-    stream: Transport<T>,
+    stream: FramedRead<ReadHalf<T>, Codec>,
+    sink: FramedWrite<WriteHalf<T>, Codec>,
 }
 
 impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> InnerEndpoint<MH, T> {
     fn new(handler: MH, stream: T) -> Self {
-        InnerEndpoint { handler, stream: Codec.framed(stream) }
+        let (reader, writer) = stream.split();
+        InnerEndpoint {
+            handler,
+            stream: FramedRead::new(reader, Codec),
+            sink: FramedWrite::new(writer, Codec),
+        }
     }
 }
 
@@ -514,7 +518,7 @@ impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> Future for InnerEndpoint<MH,
         // Try to flush out all the responses that are queued up. If this doesn't succeed yet, our
         // output sink is full. In that case, we'll apply some backpressure to our input stream by
         // not reading from it.
-        if let Async::NotReady = self.handler.send_outgoing(&mut self.stream)? {
+        if let Async::NotReady = self.handler.send_outgoing(&mut self.sink)? {
             trace!("Sink not yet flushed, waiting...");
             return Ok(Async::NotReady);
         }
@@ -560,10 +564,7 @@ struct ServerEndpoint<S: Service, T: AsyncRead + AsyncWrite> {
 impl<S: Service, T: AsyncRead + AsyncWrite> ServerEndpoint<S, T> {
     pub fn new(stream: T, service: S) -> Self {
         ServerEndpoint {
-            inner: InnerEndpoint {
-                stream: Codec.framed(stream),
-                handler: Server::new(service),
-            },
+            inner: InnerEndpoint::new(Server::new(service), stream),
         }
     }
 }
