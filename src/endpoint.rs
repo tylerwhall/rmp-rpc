@@ -143,23 +143,23 @@ impl<S: ServiceWithClient> Server<S> {
     //
     // Returns Async::Ready if all of the pending responses were successfully sent on their way.
     // (This does not necessarily mean that they were received yet.)
-    fn send_responses<T: AsyncRead + AsyncWrite>(
+    fn send_responses<T: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        sink: &mut Transport<T>,
+        sink: &mut T,
     ) -> Poll<(), io::Error> {
         while let Ok(poll) = self.pending_responses.poll() {
             if let Async::Ready(Some((id, result))) = poll {
                 let msg = Message::Response(MsgPackResponse { id, result });
                 // FIXME: in futures 0.2, use poll_ready before reading from pending_responses, and
                 // don't panic here.
-                sink.0.start_send(msg).unwrap();
+                sink.start_send(msg).unwrap();
             } else {
                 if let Async::Ready(None) = poll {
                     panic!("we store the sender, it can't be dropped");
                 }
 
                 // We're done pushing all messages into the sink, now try to flush it.
-                return sink.0.poll_complete();
+                return sink.poll_complete();
             }
         }
         panic!("an UnboundedReceiver should never give an error");
@@ -204,9 +204,9 @@ trait MessageHandler {
     // Try to push out all of the outgoing messages (e.g. responses in the case of a server,
     // notifications+requests in the case of a client) onto the sink. Return Ok(Async::Ready(()))
     // if we managed to push them all out and flush the sink.
-    fn send_outgoing<T: AsyncRead + AsyncWrite>(
+    fn send_outgoing<T: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        sink: &mut Transport<T>,
+        sink: &mut T,
     ) -> Poll<(), io::Error>;
 
     // Is the endpoint finished? This is only relevant for clients, since servers and
@@ -423,9 +423,9 @@ impl<S: Service> MessageHandler for Server<S> {
         };
     }
 
-    fn send_outgoing<T: AsyncRead + AsyncWrite>(
+    fn send_outgoing<T: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        sink: &mut Transport<T>,
+        sink: &mut T,
     ) -> Poll<(), io::Error> {
         self.send_responses(sink)
     }
@@ -441,11 +441,11 @@ impl MessageHandler for InnerClient {
         }
     }
 
-    fn send_outgoing<T: AsyncRead + AsyncWrite>(
+    fn send_outgoing<T: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        sink: &mut Transport<T>,
+        sink: &mut T,
     ) -> Poll<(), io::Error> {
-        self.send_messages(&mut sink.0)
+        self.send_messages(sink)
     }
 
     fn is_finished(&self) -> bool {
@@ -483,12 +483,12 @@ impl<S: ServiceWithClient> MessageHandler for ClientAndServer<S> {
         };
     }
 
-    fn send_outgoing<T: AsyncRead + AsyncWrite>(
+    fn send_outgoing<T: Sink<SinkItem = Message, SinkError = io::Error>>(
         &mut self,
-        sink: &mut Transport<T>,
+        sink: &mut T,
     ) -> Poll<(), io::Error> {
         if let Async::Ready(_) = self.server.send_responses(sink)? {
-            self.inner_client.send_messages(&mut sink.0)
+            self.inner_client.send_messages(sink)
         } else {
             Ok(Async::NotReady)
         }
@@ -508,7 +508,7 @@ impl<MH: MessageHandler, T: AsyncRead + AsyncWrite> Future for InnerEndpoint<MH,
         // Try to flush out all the responses that are queued up. If this doesn't succeed yet, our
         // output sink is full. In that case, we'll apply some backpressure to our input stream by
         // not reading from it.
-        if let Async::NotReady = self.handler.send_outgoing(&mut self.stream)? {
+        if let Async::NotReady = self.handler.send_outgoing(&mut self.stream.0)? {
             trace!("Sink not yet flushed, waiting...");
             return Ok(Async::NotReady);
         }
